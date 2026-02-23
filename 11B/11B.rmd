@@ -1,0 +1,661 @@
+---
+title: "11A"
+date: "2026-01-14"
+output: html_document
+---
+
+#czesc a
+```{r}
+options(OutDec = ",")
+
+library(quantmod)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(PerformanceAnalytics)
+library(ggcorrplot)
+library(moments)
+library(vars)
+library(purrr)
+library(tseries)
+library(mgarchBEKK)
+library(BEKKs)
+
+set.seed(123)
+```
+
+```{r}
+tickers <- c('SPY', 'TLT', 'GLD', 'MSFT', 'JNJ')
+getSymbols(tickers, from = "2018-01-01", to = "2025-12-31", src = "yahoo")
+prices <- do.call(merge, lapply(tickers, function(x) Ad(get(x))))
+colnames(prices) <- tickers
+returns <- na.omit(diff(log(prices)))
+
+```
+
+```{r}
+# 2. Statystyki opisowe
+stats_table <- data.frame(
+  Mean = colMeans(returns) * 252, # Zannualizowana średnia
+  SD = apply(returns, 2, sd) * sqrt(252), # Zannualizowane odch. std.
+  Skewness = apply(returns, 2, skewness),
+  Kurtosis = apply(returns, 2, kurtosis),
+  Min = apply(returns, 2, min),
+  Max = apply(returns, 2, max)
+)
+print("Statystyki opisowe (zannualizowane dla średniej i SD):")
+print(round(stats_table, 4))
+```
+
+```{r}
+# 3. Wykresy skumulowanych stóp zwrotu z linią 0
+cum_returns <- cumsum(returns)
+cum_returns_df <- data.frame(Date = index(cum_returns), coredata(cum_returns)) %>%
+  pivot_longer(-Date, names_to = "Ticker", values_to = "Value")
+
+p1 <- ggplot(cum_returns_df, aes(x = Date, y = Value, color = Ticker)) +
+  geom_line(size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Skumulowane log-stopy zwrotu (2018-2025)",
+       subtitle = "Linia przerywana oznacza poziom zerowego zwrotu",
+       y = "Skumulowany zwrot", x = "Data")
+print(p1)
+
+# 4. Macierz korelacji (Heatmap)
+corr_matrix <- cor(returns)
+p2 <- ggcorrplot(corr_matrix, hc.order = TRUE, type = "lower",
+           lab = TRUE, lab_size = 3, method="circle", 
+           colors = c("#E46726", "white", "#6D9EC1"),
+           title="Macierz korelacji stóp zwrotu")
+print(p2)
+```
+
+```{r}
+# 3. Definicja okresów
+periods <- list(
+  Full = c("2018-01-01", "2025-12-31"),
+  P1 = c("2018-03-01", "2020-01-31"),
+  P2 = c("2020-03-01", "2022-01-31"),
+  P3 = c("2022-03-01", "2024-01-31")
+)
+# 2. Funkcja do przeprowadzenia testu ADF
+run_adf <- function(series) {
+  test <- adf.test(series, alternative = "stationary")
+  return(test$p.value)
+}
+
+# 3. Przeprowadzenie testów dla poziomów i zwrotów
+adf_levels <- apply(prices, 2, run_adf)
+adf_returns <- apply(returns, 2, run_adf)
+
+# 4. Prezentacja wyników w tabeli
+adf_results <- data.frame(
+  Ticker = tickers,
+  P_Value_Levels = round(adf_levels, 4),
+  P_Value_Returns = round(adf_returns, 4),
+  Stationary_Returns = ifelse(adf_returns < 0.05, "TAK", "NIE")
+)
+print("Wyniki testu ADF (p-value):")
+print(adf_results)
+```
+
+```{r}
+
+full_lag = as.numeric(VARselect( returns[paste0(periods$Full[1], "/", periods$Full[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+P1_lag = as.numeric(VARselect( returns[paste0(periods$P1[1], "/", periods$P1[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+P2_lag = as.numeric(VARselect( returns[paste0(periods$P2[1], "/", periods$P2[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+P3_lag = as.numeric(VARselect( returns[paste0(periods$P3[1], "/", periods$P3[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+
+lag_list = list( 
+  Full = full_lag,
+  P1 = P1_lag,
+  P2 = P2_lag,
+  P3 = P3_lag)
+```
+
+```{r}
+check_var_comprehensive <- function(data, p_name, p_dates, lags) {
+  # Wybór podzbioru danych
+  subset_data <- data[paste0(p_dates[1], "/", p_dates[2])]
+  
+  # Pobranie predefiniowanego laga z listy
+  p_lag <- lags[[p_name]]
+  
+  # Zapewnienie, że p_lag jest co najmniej 1
+  if(is.null(p_lag) || p_lag == 0) p_lag <- 1
+  
+  # Estymacja modelu
+  var_model <- VAR(subset_data, p = p_lag, type = "const")
+  var_summ <- summary(var_model)
+  
+  cat("\n========================================================\n")
+  cat("ANALIZA DLA OKRESU:", p_name, "| UŻYTE OPÓŹNIENIE (p):", p_lag, "\n")
+  cat("========================================================\n")
+  
+  # --- 1. ISTOTNOŚĆ PARAMETRÓW ---
+  cat("\n>>> ISTOTNE PARAMETRY (p < 0.05):\n")
+  for(ticker in colnames(subset_data)) {
+    coefs <- var_summ$varresult[[ticker]]$coefficients
+    sig_coefs <- coefs[coefs[, 4] < 0.05, , drop = FALSE]
+    if(nrow(sig_coefs) > 0) {
+      cat("\nRównanie", ticker, ":\n")
+      print(round(sig_coefs, 4))
+    }
+  }
+  
+  # --- 2. STATYSTYKI DOPASOWANIA ---
+  cat("\n>>> DOPASOWANIE MODELU (Adjusted R-squared):\n")
+  adj_r2 <- sapply(var_model$varresult, function(x) summary(x)$adj.r.squared)
+  print(round(adj_r2, 4))
+  
+  # --- 3. TESTY DIAGNOSTYCZNE ---
+  cat("\n>>> DIAGNOSTYKA RESZT (p-values):\n")
+  
+  # Test Autokorelacji (Portmanteau)
+  ser_p <- serial.test(var_model, lags.pt = 10, type = "PT.asymptotic")$serial$p.value
+  # Test Normalności (Jarque-Bera)
+  norm_p <- normality.test(var_model, multivariate.only = TRUE)$jb.mul$JB$p.value
+  # Test ARCH-LM
+  arch_p <- arch.test(var_model, lags.multi = 5, multivariate.only = TRUE)$arch.mul$p.value
+  
+  diag_df <- data.frame(
+    Test = c("Autokorelacja (Serial)", "Normalność (JB)", "Efekt ARCH"),
+    P_Value = round(c(ser_p, norm_p, arch_p), 4),
+    Status = ifelse(c(ser_p, norm_p, arch_p) > 0.05, "(H0 przyjęta)", "(H0 odrzucona)")
+  )
+  print(diag_df)
+  
+  return(var_model)
+}
+
+# 3. Wykonanie pętli z przekazaniem lag_list
+results_list <- lapply(names(periods), function(n) {
+  check_var_comprehensive(returns, n, periods[[n]], lag_list)
+})
+```
+
+
+```{r}
+library(lmtest)
+library(sandwich)
+
+run_robust_granger_matrix <- function(data, p_name, p_dates, lags) {
+  
+  subset_data <- data[paste0(p_dates[1], "/", p_dates[2])]
+  tickers <- colnames(subset_data)
+  n <- length(tickers)
+  
+  # Pobranie opóźnienia
+  p_lag <- lags[[p_name]]
+  if(is.null(p_lag) || p_lag == 0) p_lag <- 1
+  
+  # Macierz wyników
+  p_matrix <- matrix(NA, nrow = n, ncol = n)
+  rownames(p_matrix) <- tickers
+  colnames(p_matrix) <- tickers
+  
+  cat("\n########################################################\n")
+  cat(" ROBUST GRANGER (Newey-West HAC) - OKRES:", p_name, "| LAG:", p_lag, "\n")
+
+  # Tabela na istotne wyniki
+  sig_df <- data.frame(
+    Okres = character(),
+    Przyczyna = character(),
+    Skutek = character(),
+    P_Value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  core_data <- coredata(subset_data)
+  n_rows <- nrow(core_data)
+  
+  for (i in 1:n) { # Target (Skutek)
+    for (j in 1:n) { # Source (Przyczyna)
+      if (i != j) {
+        target_name <- tickers[i]
+        source_name <- tickers[j]
+        
+        y_vec <- core_data[(p_lag + 1):n_rows, i]
+        
+        target_lags <- embed(core_data[, i], p_lag + 1)[, -1, drop = FALSE]
+        source_lags <- embed(core_data[, j], p_lag + 1)[, -1, drop = FALSE]
+        
+        # Model Pełny (Unrestricted)
+        df_unres <- data.frame(Y = y_vec, target_lags, source_lags)
+        model_unres <- lm(Y ~ ., data = df_unres)
+        
+        # Model Ograniczony (Restricted)
+        df_res <- data.frame(Y = y_vec, target_lags)
+        model_res <- lm(Y ~ ., data = df_res)
+        
+        # Test Walda z Newey-West
+        wald_result <- waldtest(model_res, model_unres, vcov = NeweyWest(model_unres, lag = p_lag, prewhite = FALSE))
+        
+        p_val <- wald_result$`Pr(>F)`[2]
+        p_matrix[i, j] <- round(p_val, 4)
+        
+        # Jeśli istotne, dodaj do tabeli
+        if (!is.na(p_val) && p_val < 0.05) {
+          sig_df[nrow(sig_df) + 1, ] <- list(
+            Okres = p_name,
+            Przyczyna = source_name,
+            Skutek = target_name,
+            P_Value = round(p_val, 4)
+          )
+        }
+      }
+    }
+  }
+  
+  cat("\n>>> MACIERZ P-VALUE (HAC Newey-West):\n")
+  print(p_matrix)
+  
+  cat("\n>>> TABELA ISTOTNYCH ZALEŻNOŚCI (p < 0.05):\n")
+  if (nrow(sig_df) > 0) {
+    print(sig_df)
+  } else {
+    cat("Brak istotnych zależności w tym okresie.\n")
+  }
+  
+  # Zwracamy listę: Macierz + Tabela
+  return(list(Matrix = p_matrix, Significant = sig_df))
+}
+
+# Uruchomienie analizy
+robust_results <- lapply(names(periods), function(n) {
+  run_robust_granger_matrix(returns, n, periods[[n]], lag_list)
+})
+
+# --- OPCJONALNIE: ZBIORCZA TABELA NA KONIEC ---
+# Łączymy wyniki ze wszystkich okresów w jedną dużą tabelę
+all_sig_results <- do.call(rbind, lapply(robust_results, function(x) x$Significant))
+
+cat("\n========================================================\n")
+cat(" PODSUMOWANIE ZBIORCZE WSZYSTKICH ISTOTNYCH ZALEŻNOŚCI \n")
+print(all_sig_results)
+```
+
+
+
+
+
+#CZĘŚĆ B: Spillover (BEKK(1,1)) na resztach z VAR
+
+```{r}
+reszty_z_var <- function(returns, p_name, p_dates, lags) {
+  sub <- returns[paste0(p_dates[1], "/", p_dates[2])]
+  p_lag <- lags[[p_name]]
+  if (is.null(p_lag) || is.na(p_lag) || p_lag < 1) p_lag <- 1
+
+  var_model <- VAR(sub, p = p_lag, type = "const")
+
+  eps_mat <- residuals(var_model)
+  eps_mat <- na.omit(eps_mat)
+
+  # dopasowanie indeksu dat do długości reszt (bez zgadywania o p)
+  idx <- index(sub)[(nrow(sub) - nrow(eps_mat) + 1):nrow(sub)]
+  eps_xts <- xts(eps_mat, order.by = idx)
+  colnames(eps_xts) <- colnames(sub)
+
+  list(
+    eps = eps_xts,
+    var_model = var_model,
+    p_lag = p_lag
+  )
+}
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 2) Estymacja BEKK(1,1) (BEKKs: A i G)
+#    - init_values="simple" stabilniej dla N=5
+#    - jeśli full BEKK nie siądzie, robimy fallback na diagonal dbekk
+# ---------------------------------------------------------
+dopasuj_bekk <- function(eps_xts,
+                         model_type = "bekk",
+                         QML_t_ratios = TRUE,
+                         max_iter = 80,
+                         crit = 1e-9) {
+
+  spec <- bekk_spec(
+    model = list(type = model_type, asymmetric = FALSE),
+    init_values = "simple"
+  )
+
+  fit <- tryCatch(
+    bekk_fit(spec, eps_xts, QML_t_ratios = QML_t_ratios, max_iter = max_iter, crit = crit),
+    error = function(e) NULL
+  )
+
+  # fallback: diagonal BEKK jeśli full nie zadziała
+  if (is.null(fit)) {
+    set.seed(123)
+    message("Full BEKK nie zbiega / błąd -> próbuję dbekk (diagonal).")
+    spec2 <- bekk_spec(
+      model = list(type = "dbekk", asymmetric = FALSE),
+      init_values = "simple"
+    )
+    fit <- bekk_fit(spec2, eps_xts, QML_t_ratios = QML_t_ratios, max_iter = max_iter, crit = crit)
+  }
+
+  fit
+}
+```
+
+
+Spillover testy (A i G) + łączny (chi^2) na t-value
+```{r}
+test_spillover <- function(fit_bekk, nazwy) {
+
+  A  <- fit_bekk$A
+  G  <- fit_bekk$G
+  tA <- fit_bekk$A_t
+  tG <- fit_bekk$G_t
+
+  if (is.null(tA) || is.null(tG)) {
+    stop("Brak A_t lub G_t w obiekcie BEKK. Ustaw QML_t_ratios=TRUE albo sprawdź wersję BEKKs.")
+  }
+
+  k <- length(nazwy)
+
+  wyniki <- data.frame(
+    Do = character(),
+    Z  = character(),
+    A  = numeric(),
+    Wartosc_p_A = numeric(),
+    G  = numeric(),
+    Wartosc_p_G = numeric(),
+    Stat_chi2 = numeric(),
+    Wartosc_p_AG = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in 1:k) {        # i = Do (cel)
+    for (j in 1:k) {      # j = Z  (źródło)
+      if (i == j) next
+
+      # UWAGA: kierunek Z -> Do w BEKKs to element [Z,Do] = [j,i]
+      tA_ji <- tA[j, i]
+      tG_ji <- tG[j, i]
+
+      pA <- 2 * (1 - pnorm(abs(tA_ji)))
+      pG <- 2 * (1 - pnorm(abs(tG_ji)))
+
+      chi2 <- tA_ji^2 + tG_ji^2
+      pAG  <- 1 - pchisq(chi2, df = 2)
+
+      wyniki[nrow(wyniki) + 1, ] <- list(
+        Do = nazwy[i],
+        Z  = nazwy[j],
+        A  = A[j, i],
+        Wartosc_p_A = pA,
+        G  = G[j, i],
+        Wartosc_p_G = pG,
+        Stat_chi2 = chi2,
+        Wartosc_p_AG = pAG
+      )
+    }
+  }
+
+  wyniki[order(wyniki$Wartosc_p_AG), ]
+}
+
+
+```
+
+
+
+```{r}
+# ---------------------------------------------------------
+# 4) Wizualizacja 1: heatmapa spillover (p_AG)
+# ---------------------------------------------------------
+plot_spillover_heatmap <- function(tab_spill, nazwy, period_name) {
+  M <- matrix(NA_real_, nrow = length(nazwy), ncol = length(nazwy),
+              dimnames = list(nazwy, nazwy))
+
+  for (r in 1:nrow(tab_spill)) {
+    M[tab_spill$Do[r], tab_spill$Z[r]] <- tab_spill$Wartosc_p_AG[r]
+  }
+
+  df <- as.data.frame(as.table(M)) |>
+    dplyr::rename(Do = Var1, Z = Var2, p = Freq) |>
+    dplyr::filter(!is.na(p)) |>
+    dplyr::mutate(
+      score = -log10(p),
+      star = dplyr::case_when(
+        p < 0.001 ~ "***",
+        p < 0.01  ~ "**",
+        p < 0.05  ~ "*",
+        TRUE ~ ""
+      ),
+      Do = factor(Do, levels = nazwy),
+      Z  = factor(Z,  levels = nazwy)
+    )
+
+  ggplot(df, aes(x = Z, y = Do, fill = score)) +
+    geom_tile() +
+    geom_text(aes(label = star), size = 4) +
+    labs(
+      title = paste0("Spillover (BEKK(1,1)) — ", period_name),
+      subtitle = "Komórka: Z -> Do, kolor = -log10(p) z testu łącznego (A i G), gwiazdki: istotność",
+      x = "Z (źródło)", y = "Do (cel)", fill = "-log10(p)"
+    ) +
+    theme_minimal()
+}
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 5) Wizualizacja 2: top warunkowe korelacje (sigma_t)
+# ---------------------------------------------------------
+plot_top_condcorr <- function(fit_bekk, tab_spill, top_n = 3, period_name) {
+  st <- fit_bekk$sigma_t
+  if (!inherits(st, "xts")) return(NULL)
+
+  top_pairs <- tab_spill |>
+    dplyr::slice_head(n = top_n) |>
+    dplyr::mutate(Pair = paste0(Z, " -> ", Do))
+
+  pick_corr_col <- function(st_cols, a, b) {
+    # kolumny mają tekst: "Conditional correlation of \n A and B"
+    ix <- which(grepl("Conditional correlation", st_cols) &
+                  grepl(a, st_cols, fixed = TRUE) &
+                  grepl(b, st_cols, fixed = TRUE))
+    if (length(ix) == 0) return(NA_character_)
+    st_cols[ix[1]]
+  }
+
+  cols <- colnames(st)
+  out_list <- lapply(1:nrow(top_pairs), function(i) {
+    a <- top_pairs$Do[i]
+    b <- top_pairs$Z[i]
+    colname <- pick_corr_col(cols, a, b)
+    if (is.na(colname)) colname <- pick_corr_col(cols, b, a)
+    if (is.na(colname)) return(NULL)
+
+    data.frame(
+      Date = zoo::index(st),
+      Value = as.numeric(st[, colname]),
+      Pair = top_pairs$Pair[i]
+    )
+  })
+
+  df <- dplyr::bind_rows(out_list)
+  if (nrow(df) == 0) return(NULL)
+
+  ggplot(df, aes(x = Date, y = Value)) +
+    geom_line() +
+    facet_wrap(~Pair, scales = "free_y", ncol = 1) +
+    labs(
+      title = paste0("Top warunkowe korelacje — ", period_name),
+      subtitle = "Wykresy dla par o najmniejszych p (test łączny A i G)",
+      x = "Data", y = "Korelacja warunkowa"
+    ) +
+    theme_minimal()
+}
+```
+
+wyniki
+
+```{r}
+# ---------------------------------------------------------
+# 6) Uruchomienie: Full + P1 + P2 + P3
+# ---------------------------------------------------------
+bekk_wyniki <- list()
+
+for (n in names(periods)) {
+
+  cat("\n===========================\n")
+  cat("CZĘŚĆ B: BEKK(1,1) | OKRES:", n, "\n")
+
+  tmp <- reszty_z_var(returns, n, periods[[n]], lag_list)
+
+  cat("Użyte opóźnienie VAR (p):", tmp$p_lag, "\n")
+  cat("Liczba obserwacji w resztach:", nrow(tmp$eps), "\n")
+
+  fit <- dopasuj_bekk(
+    eps_xts = tmp$eps,
+    model_type = "bekk",
+    max_iter = 80,
+    crit = 1e-9
+  )
+
+  cat("BEKK_valid:", fit$BEKK_valid, "\n")
+  if (!is.null(fit$Portmanteau.test)) {
+    cat("Portmanteau p-value:", fit$Portmanteau.test$p.value, "\n")
+  }
+
+  nazwy <- colnames(tmp$eps)
+
+  tab_spill <- test_spillover(fit, nazwy)
+
+  tab_print <- tab_spill
+  tab_print[, c("A","Wartosc_p_A","G","Wartosc_p_G","Stat_chi2","Wartosc_p_AG")] <-
+    round(tab_print[, c("A","Wartosc_p_A","G","Wartosc_p_G","Stat_chi2","Wartosc_p_AG")], 6)
+
+  cat("\n>>> TOP 15 NAJSILNIEJSZYCH SPILLOVER (test łączny A i G):\n")
+  print(head(tab_print, 15))
+
+  # heatmapa spillover
+  print(plot_spillover_heatmap(tab_spill, nazwy, n))
+
+  # top korelacje warunkowe (dla najlepszych spillover)
+  p_cc <- plot_top_condcorr(fit, tab_spill, top_n = 3, period_name = n)
+  if (!is.null(p_cc)) print(p_cc)
+
+  bekk_wyniki[[n]] <- list(
+    var_lag = tmp$p_lag,
+    var_model = tmp$var_model,
+    eps = tmp$eps,
+    bekk = fit,
+    spillover = tab_spill
+  )
+}
+```
+
+
+Zbiorcze podsumowanie: istotne spillover (p < 0.05)
+```{r}
+istotne_spill <- do.call(rbind, lapply(names(bekk_wyniki), function(n) {
+  x <- bekk_wyniki[[n]]$spillover
+  x$Okres <- n
+  x[!is.na(x$Wartosc_p_AG) & x$Wartosc_p_AG < 0.05, c("Okres","Z","Do","A","Wartosc_p_A","G","Wartosc_p_G","Stat_chi2","Wartosc_p_AG")]
+}))
+
+cat("\n========================================================\n")
+cat("PODSUMOWANIE: ISTOTNE SPILLOVER (p < 0.05) – wszystkie okresy\n")
+
+if (is.null(istotne_spill) || nrow(istotne_spill) == 0) {
+  cat("Brak istotnych spillover dla progu 0,05.\n")
+} else {
+  istotne_spill <- istotne_spill[order(istotne_spill$Okres, istotne_spill$Wartosc_p_AG), ]
+  istotne_spill_print <- istotne_spill
+num_cols <- sapply(istotne_spill_print, is.numeric)
+istotne_spill_print[, num_cols] <- round(istotne_spill_print[, num_cols], 6)
+print(istotne_spill_print)
+
+}
+```
+
+Zbiorcza tabela: ile istotnych, minimalne p, TOP5
+
+```{r}
+# =========================================================
+# MINIMALNE PODSUMOWANIE CZĘŚCI B (BEKK spillover)
+# =========================================================
+
+# 1) Zbiorcza tabela: ile istotnych, minimalne p, TOP5
+podsumuj_bekk <- function(bekk_wyniki, alfa = 0.05, top_n = 5) {
+
+  okresy <- names(bekk_wyniki)
+
+  summary_tbl <- do.call(rbind, lapply(okresy, function(ok) {
+    sp <- bekk_wyniki[[ok]]$spillover
+    sp <- sp[!is.na(sp$Wartosc_p_AG), ]
+    data.frame(
+      Okres = ok,
+      N_reszt = nrow(bekk_wyniki[[ok]]$eps),
+      BEKK_valid = if (!is.null(bekk_wyniki[[ok]]$bekk$BEKK_valid)) bekk_wyniki[[ok]]$bekk$BEKK_valid else NA,
+      Min_p_AG = min(sp$Wartosc_p_AG, na.rm = TRUE),
+      Liczba_istotnych = sum(sp$Wartosc_p_AG < alfa, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  top_tbl <- do.call(rbind, lapply(okresy, function(ok) {
+    sp <- bekk_wyniki[[ok]]$spillover
+    sp <- sp[!is.na(sp$Wartosc_p_AG), ]
+    sp <- sp[order(sp$Wartosc_p_AG), ]
+    head(sp[, c("Z","Do","Wartosc_p_AG","Wartosc_p_A","Wartosc_p_G")], top_n) |>
+      transform(Okres = ok, .before = 1)
+  }))
+
+  # zaokrąglenie do raportu
+  num_cols1 <- sapply(summary_tbl, is.numeric)
+  summary_tbl[, num_cols1] <- round(summary_tbl[, num_cols1], 6)
+
+  num_cols2 <- sapply(top_tbl, is.numeric)
+  top_tbl[, num_cols2] <- round(top_tbl[, num_cols2], 6)
+
+  list(podsumowanie = summary_tbl, top = top_tbl)
+}
+
+wyn <- podsumuj_bekk(bekk_wyniki, alfa = 0.05, top_n = 5)
+
+cat("\n================ PODSUMOWANIE OKRESÓW (BEKK) ================\n")
+print(wyn$podsumowanie)
+
+cat("\n================ TOP 5 RELACJI (NAJNIŻSZE p_AG) ================\n")
+print(wyn$top)
+
+```
+
+heatmapa tylko gdy są istotne spillover
+```{r}
+for (ok in names(bekk_wyniki)) {
+  sp <- bekk_wyniki[[ok]]$spillover
+  if (any(sp$Wartosc_p_AG < 0.05, na.rm = TRUE)) {
+    print(plot_spillover_heatmap(sp, colnames(bekk_wyniki[[ok]]$eps), ok))
+  } else {
+    cat("\n", ok, ": brak istotnych spillover (p < 0,05) -> heatmapa pominięta.\n", sep = "")
+  }
+}
+
+```
+```{r}
+for (i in 1:nrow(wyn$podsumowanie)) {
+  ok <- wyn$podsumowanie$Okres[i]
+  minp <- wyn$podsumowanie$Min_p_AG[i]
+  k <- wyn$podsumowanie$Liczba_istotnych[i]
+
+  if (k == 0) {
+    cat(ok, ": brak istotnych spillover (test łączny A i G); minimalna wartość p =", format(minp, decimal.mark=","), ".\n", sep="")
+  } else {
+    cat(ok, ": wykryto", k, "istotnych spillover (p < 0,05); minimalna wartość p =", format(minp, decimal.mark=","), ".\n", sep="")
+  }
+}
+```
+

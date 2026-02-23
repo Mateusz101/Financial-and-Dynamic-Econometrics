@@ -1,0 +1,247 @@
+---
+title: '12'
+author: "Patrycja Piła"
+date: "2026-01-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+options(OutDec = ",")
+
+library(quantmod)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tseries)
+library(vars)
+library(quantmod)
+library(vars)
+library(purrr)
+library(tseries)
+library(frequencyConnectedness)
+library(moments)
+set.seed(123)
+
+library(ggforce)
+```
+
+```{r}
+tickers <- c('SPY', 'TLT', 'GLD', 'MSFT', 'JNJ')
+getSymbols(tickers, from = "2018-03-01", to = "2020-01-31", src = "yahoo")
+prices <- do.call(merge, lapply(tickers, function(x) Ad(get(x))))
+colnames(prices) <- tickers
+returns <- na.omit(diff(log(prices)))
+
+```
+
+
+
+```{r}
+# 2. Statystyki opisowe
+stats_table <- data.frame(
+  Mean = colMeans(returns) * 252, # Zannualizowana średnia
+  SD = apply(returns, 2, sd) * sqrt(252), # Zannualizowane odch. std.
+  Skewness = apply(returns, 2, skewness),
+  Kurtosis = apply(returns, 2, kurtosis),
+  Min = apply(returns, 2, min),
+  Max = apply(returns, 2, max)
+)
+print("Statystyki opisowe (zannualizowane dla średniej i SD):")
+print(round(stats_table, 4))
+```
+
+```{r}
+# 3. Wykresy skumulowanych stóp zwrotu z linią 0
+cum_returns <- 1 + cumsum(returns)
+cum_returns_df <- data.frame(Date = index(cum_returns), coredata(cum_returns)) %>%
+  pivot_longer(-Date, names_to = "Ticker", values_to = "Value")
+
+p1 <- ggplot(cum_returns_df, aes(x = Date, y = Value, color = Ticker)) +
+  geom_line(size = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Skumulowane log-stopy zwrotu (2018-2020)",
+       subtitle = "Linia przerywana oznacza wartość początkową (1)",
+       y = "Skumulowany zwrot", x = "Data")
+print(p1)
+
+# 4. Macierz korelacji (Heatmap)
+corr_matrix <- cor(returns)
+p2 <- ggcorrplot(corr_matrix, hc.order = TRUE, type = "lower",
+           lab = TRUE, lab_size = 3, method="circle", 
+           colors = c("#E46726", "white", "#6D9EC1"),
+           title="Macierz korelacji stóp zwrotu")
+print(p2)
+```
+
+```{r}
+# 2. DIAGNOSTYKA (Stacjonarność i Efekty ARCH)
+cat("--- Testy Stacjonarności (ADF) ---\n")
+apply(returns, 2, function(x) adf.test(x, k=10)$p.value)
+```
+
+```{r}
+# 3. Dobór opóźnień i estymacja modelu VAR
+
+var_select <- VARselect(returns, lag.max = 10, type = "const")
+print(var_select$selection)
+p_opt <- var_select$selection["AIC(n)"]
+fit <- VAR(returns, p = 1, type = "const")
+
+cat("Wybrane opóźnienie (AIC):", p_opt, "\n\n")
+
+# 2. Test stabilności (Roots)
+roots <- roots(fit)
+is_stable <- all(roots < 1)
+cat("--- Stabilność modelu ---\n")
+cat("Czy model jest stabilny:", is_stable, "\n")
+cat("Wartości własne:", round(roots, 4), "\n\n")
+roots_df <- data.frame(
+  Re = Re(roots),
+  Im = Im(roots)
+)
+
+ggplot(roots_df, aes(x = Re, y = Im)) +
+  geom_point(size = 3) +
+  geom_circle(aes(x0 = 0, y0 = 0, r = 1),
+              color = "red", linetype = "dashed") +
+  coord_fixed() +
+  labs(
+    title = "Roots of VAR model (Stability Check)",
+    x = "Real part",
+    y = "Imaginary part"
+  ) +
+  theme_minimal()
+
+# 3. Test autokorelacji (Portmanteau)
+# H0: Brak autokorelacji reszt
+serial_test <- serial.test(fit, lags.pt = 10, type = "PT.asymptotic")
+cat("--- Test autokorelacji (Portmanteau) ---\n")
+print(serial_test)
+
+# 4. Test heteroskedastyczności (ARCH)
+# H0: Brak efektów ARCH (stała wariancja reszt)
+arch_test <- arch.test(fit, lags.multi = 10, multivariate.only = TRUE)
+cat("\n--- Test efektów ARCH ---\n")
+print(arch_test)
+
+# 5. Test normalności (Jarque-Bera)
+# H0: Reszty mają rozkład normalny
+norm_test <- normality.test(fit, multivariate.only = TRUE)
+cat("\n--- Test normalności reszt ---\n")
+print(norm_test)
+
+```
+
+
+
+
+```{r}
+
+analyze_spillover <- function(data, order_names, label) {
+  # Reorganizacja danych wg nowej kolejności
+  data_subset <- data[, order_names]
+  model <- VAR(data_subset, p = 1, type = "const")
+  
+  # Obliczanie FEVD (DY09)
+  spill <- spilloverDY09(model, n.ahead = 10, no.corr=FALSE)
+  
+  # Bezpieczne wyciągnięcie TSI (Indeks Całkowity)
+  # W wersji 0.2.4 overall(spill) zwraca wektor/wartość
+  tsi_val <- as.numeric(overall(spill))
+  
+  return(list(spill = spill, tsi = tsi_val, mat = spill$tables[[1]]))
+}
+
+# --- TESTOWANIE RÓŻNYCH KOLEJNOŚCI ---
+
+# Kolejność 1: Oryginalna
+order1 <- c("SPY", "TLT", "GLD", "MSFT", "JNJ")
+res1 <- analyze_spillover(returns, order1, "Oryginalna")
+
+# Kolejność 2: Odwrócona (JNJ na początku - agresywne założenie)
+order2 <- rev(order1)
+res2 <- analyze_spillover(returns, order2, "Odwrócona")
+
+# Kolejność 3: MSFT na początku (dominacja Tech)
+order3 <- c("MSFT", "SPY", "JNJ", "TLT", "GLD")
+res3 <- analyze_spillover(returns, order3, "MSFT First")
+
+cat("\n--- PORÓWNANIE INDEKSU CAŁKOWITEGO (TSI) ---\n")
+cat("TSI (Kolejność 1 - Oryginalna): ", round(res1$tsi, 2), "%\n")
+cat("TSI (Kolejność 2 - Odwrócona):  ", round(res2$tsi, 2), "%\n")
+cat("TSI (Kolejność 3 - MSFT First): ", round(res3$tsi, 2), "%\n")
+
+# --- WIZUALIZACJA (Dla kolejności oryginalnej) ---
+
+# A. Przygotowanie danych do STACKED FEVD (o który prosiłeś)
+spill_mat <- res1$mat
+plot_data <- as.data.frame(spill_mat)
+plot_data$Target <- rownames(plot_data)
+plot_long_stacked <- melt(plot_data, id.vars = "Target", variable.name = "Source")
+
+# Wykres Stacked FEVD
+p1 <- ggplot(plot_long_stacked, aes(x = Target, y = value, fill = Source)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Dekompozycja Wariancji (FEVD) - Udziały Szoków",
+       subtitle = paste("Total Spillover Index (TSI):", round(res1$tsi, 2), "%"),
+       x = "Instrument odbierający szok (Target)",
+       y = "Udział w błędzie prognozy (%)",
+       fill = "Źródło szoku") +
+  theme_minimal()
+
+# B. Wykresy Kierunkowe (To/From) - Naprawa błędu plotFrom
+from_val <- from(res1$spill)[[1]]
+to_val <- to(res1$spill)[[1]]
+plot_df <- data.frame(
+  Asset = names(from_val),
+  From = as.numeric(from_val),
+  To = as.numeric(to_val)
+) %>% mutate(Net = To - From)
+
+# --- GENEROWANIE WYKRESÓW ---
+
+# Wykres 1: Stacked FEVD
+plot_data_stacked <- as.data.frame(res1$mat)
+plot_data_stacked$Target <- rownames(plot_data_stacked)
+plot_long_stacked <- melt(plot_data_stacked, id.vars = "Target", variable.name = "Source")
+
+p1 <- ggplot(plot_long_stacked, aes(x = Target, y = value, fill = Source)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Dekompozycja Wariancji (FEVD) - Udziały Szoków",
+       subtitle = paste("Total Spillover Index (TSI):", round(res1$tsi, 2), "%"),
+       x = "Instrument Target", y = "Udział (%)", fill = "Źródło szoku") +
+  theme_minimal()
+
+# Wykres 2: Directional To/From
+plot_long_dir <- plot_df %>%
+  pivot_longer(cols = c("From", "To"), names_to = "Direction", values_to = "Value")
+
+p2 <- ggplot(plot_long_dir, aes(x = Asset, y = Value, fill = Direction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("#E41A1C", "#377EB8")) +
+  labs(title = "Kierunkowe efekty przenoszenia (To/From)",
+       x = "Instrument", y = "Wartość (%)") +
+  theme_minimal()
+
+# Wykres 3: Net Spillovers
+p3 <- ggplot(plot_df, aes(x = reorder(Asset, Net), y = Net, fill = Net > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("TRUE" = "darkgreen", "FALSE" = "darkred"), guide = "none") +
+  labs(title = "Efekty netto (Net Spillovers)",
+       subtitle = "Dodatnie = Nadawca netto, Ujemne = Odbiorca netto",
+       x = "Instrument", y = "Net Spillover (%)")
+
+# Wyświetlenie wszystkich wykresów
+print(p1)
+print(p2)
+print(p3)
+```

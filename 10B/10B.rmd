@@ -1,0 +1,321 @@
+---
+title: "10 B"
+author: "Patrycja Piła"
+date: "2026-01-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(quantmod)
+library(vars)
+library(tseries)
+library(rmgarch)
+library(BEKKs)
+library(PerformanceAnalytics)
+library(future.apply)
+library(tidyverse)
+library(quadprog)
+
+# 1. POBIERANIE I PRZYGOTOWANIE DANYCH
+TICKERY <- c('SPY', 'TLT', 'GLD', 'MSFT', 'JNJ')
+getSymbols(TICKERY, from = "2016-01-01", to = "2025-12-31")
+prices <- do.call(merge, lapply(TICKERY, function(x) Cl(get(x))))
+colnames(prices) <- TICKERY
+returns <- na.omit(diff(log(prices)))
+```
+
+```{r}
+growth <- exp(cumsum(returns))
+growth <- as.data.frame(growth)
+growth$Date <- index(returns)
+stats <- tibble(
+  Ticker = colnames(returns),
+  TotalReturn = (as.numeric(tail(growth[, Ticker], 1)) - 1) * 100,
+  Volatility = apply(returns, 2, sd) * sqrt(252) * 100
+)
+growth_long <- growth |>
+  pivot_longer(-Date, names_to = "Ticker", values_to = "Growth") |>
+  left_join(stats, by = "Ticker") |>
+  mutate(
+    PanelTitle = paste0(
+      Ticker,
+      " | Zwrot całk.: ", round(TotalReturn, 1), "%",
+      " | Zmienność roczna: ", round(Volatility, 1), "%"
+    )
+  )
+
+
+ggplot(growth_long, aes(x = Date, y = Growth, color = Ticker)) +
+  geom_line(linewidth = 0.9) +
+  labs(
+    title = "Skumulowany wzrost instrumentów",
+    x = "Data",
+    y = "Wartość portfela (start = 1)",
+    color = "Ticker"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+```
+```{r}
+
+stats_desc <- returns |>
+  as.data.frame() |>
+  summarise(across(
+    everything(),
+    list(
+      Mean = ~ mean(.x, na.rm = TRUE),
+      Median = ~ median(.x, na.rm = TRUE),
+      SD = ~ sd(.x, na.rm = TRUE),
+      Min = ~ min(.x, na.rm = TRUE),
+      Max = ~ max(.x, na.rm = TRUE),
+      Skewness = ~ e1071::skewness(.x, na.rm = TRUE),
+      Eksces = ~ e1071::kurtosis(.x, na.rm = TRUE)
+    )
+  )) |>
+  tidyr::pivot_longer(
+    everything(),
+    names_to = c("Ticker", "Statistic"),
+    names_sep = "_",
+    values_to = "Value"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = Statistic,
+    values_from = Value
+  )
+
+stats_desc
+```
+
+
+```{r}
+# 2. DIAGNOSTYKA (Stacjonarność i Efekty ARCH)
+cat("--- Testy Stacjonarności (ADF) ---\n")
+apply(returns, 2, function(x) adf.test(x)$p.value)
+```
+
+
+```{r}
+library("CVXR")
+# Funkcja do wag MVP
+calc_mvp_weights <- function(sigma) {
+  n <- ncol(sigma)
+  w <- Variable(n)
+  
+  objective <- Minimize(quad_form(w, sigma))  # minimalizacja wariancji
+  constraints <- list(sum(w) == 1, w >= 0)    # brak shortowania
+  problem <- Problem(objective, constraints)
+  
+  result <- solve(problem)
+  return(as.vector(result$getValue(w)))
+}
+
+
+```
+
+
+```{r}
+window_len <- 500
+step_len <- 5
+start_date <- "2019-01-02"
+test_indices <- which(index(returns) >= as.Date(start_date))
+all_results <- data.frame()
+counter <- 0
+for (i in seq(test_indices[1], nrow(returns) - step_len, by = step_len)) {
+  counter <- counter + 1
+  
+  # Okno estymacyjne i testowe
+  train_data <- returns[(i - window_len):(i - 1), ]
+  future_data <- returns[i:(i + step_len - 1), ]
+  current_date <- index(returns)[i]
+  
+  # A. VAR wewnątrz pętli
+  v_sel <- VARselect(train_data, lag.max = 5, type = "const")$selection["HQ(n)"]
+  v_fit <- VAR(train_data, p = v_sel, type = "const")
+  resids <- residuals(v_fit)
+  
+  # B. Modele GARCH
+  # 1. BEKK-GARCH (Normal)
+  tryCatch({
+    b_spec <- bekk_spec(model = list(type = "bekk", asymmetric = FALSE))
+    b_fit <- bekk_fit(b_spec, resids)
+    b_fcst <- predict(b_fit, n.ahead = 1, ci = 0.50)
+    s_bekk <- matrix(as.numeric(b_fcst$H_t_forecast[1, ]), nrow = 5, ncol = 5)
+    w_bekk <- calc_mvp_weights(s_bekk)
+    ret_bekk <- as.matrix(future_data) %*% w_bekk
+  }, error = function(e) { ret_bekk <<- rep(NA, step_len) })
+  scale_factor <- 100
+  resids_scaled <- resids * scale_factor
+  # Specyfikacja Univariate dla DCC
+  u_spec <- ugarchspec(variance.model = list(model = "sGARCH"),mean.model = list(
+    armaOrder = c(0,0), 
+    include.mean = FALSE
+  ))
+  m_spec <- multispec(replicate(5, u_spec))
+  
+  # 2. DCC-GARCH Normal
+  tryCatch({
+    dcc_n_spec <- dccspec(m_spec, dccOrder = c(1,1), model = "DCC", distribution = "mvnorm")
+    dcc_n_fit <- dccfit(dcc_n_spec, data = resids_scaled, solver = "gosolnp")
+    s_dcc_n <- rcov(dccforecast(dcc_n_fit, n.ahead = 1))[[1]][,,1] / (scale_factor^2)
+    w_dcc_n <- calc_mvp_weights(s_dcc_n)
+    ret_dcc_n <- as.matrix(future_data) %*% w_dcc_n
+  }, error = function(e) { ret_dcc_n <<- rep(NA, step_len) })
+  
+  # 3. DCC-GARCH Student-t
+  tryCatch({
+    dcc_t_spec <- dccspec(m_spec, dccOrder = c(1,1), model = "DCC", distribution = "mvt")
+    dcc_t_fit <- dccfit(dcc_t_spec, data = resids_scaled, solver = "gosolnp")
+    s_dcc_t <- rcov(dccforecast(dcc_t_fit, n.ahead = 1))[[1]][,,1] / (scale_factor^2)
+    w_dcc_t <- calc_mvp_weights(s_dcc_t)
+    ret_dcc_t <- as.matrix(future_data) %*% w_dcc_t
+  }, error = function(e) { ret_dcc_t <<- rep(NA, step_len) })
+  
+  # Zbieranie wyników
+  temp_df <- data.frame(
+    Date = index(future_data),
+    BEKK_Norm = ret_bekk,
+    DCC_Norm = ret_dcc_n,
+    DCC_t = ret_dcc_t
+  )
+  all_results <- rbind(all_results, temp_df)
+  
+  # LOGOWANIE POSTĘPU
+  if (counter %% 10 == 0) {
+    cat(sprintf("[%s] Przetworzono %d okien. Bieżąca data: %s\n", 
+                Sys.time(), counter, current_date))
+  }
+}
+
+```
+
+
+```{r}
+library(tidyverse)
+ 
+df_cum <- all_results |>
+  arrange(Date) |>
+  mutate(
+    BEKK_Norm = cumsum(BEKK_Norm),
+    DCC_Norm  = cumsum(DCC_Norm),
+    DCC_t     = cumsum(DCC_t)
+  ) |>
+  pivot_longer(-Date, names_to = "Model", values_to = "CumReturn")
+
+ggplot(df_cum, aes(Date, CumReturn, color = Model)) +
+  geom_line(linewidth = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c(
+    "BEKK_Norm" = "#1B9E77",
+    "DCC_Norm"  = "#D95F02",
+    "DCC_t"     = "#7570B3"
+  )) +
+  labs(
+    title = "Skumulowane stopy zwrotu",
+    subtitle = "Porównanie modeli BEKK i DCC",
+    x = "Data",
+    y = "Skumulowana stopa zwrotu",
+    color = "Model"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+all_results = read.csv("wynikii.csv")
+# usuń kolumnę X
+all_results$X <- NULL
+
+# zamień Date na klasę Date
+all_results$Date <- as.Date(all_results$Date)
+```
+
+```{r}
+
+# 5. FINALIZACJA I WYKRES
+results_xts <- xts(all_results[,-1], order.by = all_results$Date)
+results_xts <- na.omit(results_xts)
+
+charts.PerformanceSummary(
+  results_xts,
+  main = "Wyniki portfela MVP",
+  colorset = c("#1B1F3B", "#4B88A2", "#C4A35A")
+)
+
+
+```
+
+
+```{r}
+stats_table <- function(returns_xts) {
+  # Miary stopy zwrotu i Sharpe
+  ann_ret <- table.AnnualizedReturns(returns_xts)
+  
+  # Miary ryzyka (VaR i ES przy poziomie ufności 95%)
+  var_95 <- VaR(returns_xts, p = 0.95, method = "historical")
+  es_95 <- ES(returns_xts, p = 0.95, method = "historical")
+  
+  # Max Drawdown
+  mdd <- maxDrawdown(returns_xts)
+  
+  # Łączenie w jedną tabelę
+  final_tab <- rbind(ann_ret, var_95, es_95, mdd)
+  rownames(final_tab)[4:6] <- c("VaR (95%)", "ES (95%)", "Max Drawdown")
+  return(final_tab)
+}
+
+tabela_wynikow <- stats_table(results_xts)
+print(round(tabela_wynikow, 4))
+```
+
+```{r}
+# A. Wykres obsunięć kapitału (Drawdowns)
+par(mar = c(5, 7, 4, 2))  # większy lewy margines
+
+chart.Drawdown(
+  results_xts, 
+  main = "Obsunięcia kapitału",
+  colorset = c("#1B1F3B", "#4B88A2", "#C4A35A"),
+  legend.loc = "bottomleft"
+)
+
+mtext("Data", side = 1, line = 2.5)
+mtext("Obsunięcie kapitału", side = 2, line = 6)
+
+
+# B. Wykres rozkładu stóp zwrotu (Boxplot) - porównanie ogonów
+chart.Boxplot(
+  results_xts, 
+  main = "Rozkład stóp zwrotu – porównanie modeli",
+  colorset = c("#1B1F3B", "#4B88A2", "#C4A35A")
+)
+
+mtext("Model", side = 1, line = 2.5)
+mtext("Stopa zwrotu", side = 2, line = 2.5)
+
+
+```
+
+```{r}
+cum_growth <- cumprod(1 + results_xts)
+
+chart.TimeSeries(
+  cum_growth,
+  main = "Skumulowana wartość portfela (start = 1)",
+  legend.loc = "topleft",
+  colorset = c("#1B1F3B", "#4B88A2", "#C4A35A"),
+  ylab = "Wartość portfela",
+  xlab = "Data"
+)
+
+```

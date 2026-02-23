@@ -1,0 +1,282 @@
+---
+title: "11A"
+author: "Patrycja Piła"
+date: "2026-01-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R 
+
+```{r}
+library(quantmod)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(PerformanceAnalytics)
+library(ggcorrplot)
+library(moments)
+library(quantmod)
+library(vars)
+library(dplyr)
+library(purrr)
+library(tseries)
+```
+
+```{r}
+tickers <- c('SPY', 'TLT', 'GLD', 'MSFT', 'JNJ')
+getSymbols(tickers, from = "2018-01-01", to = "2025-12-31", src = "yahoo")
+prices <- do.call(merge, lapply(tickers, function(x) Ad(get(x))))
+colnames(prices) <- tickers
+returns <- na.omit(diff(log(prices)))
+
+```
+
+```{r}
+# 2. Statystyki opisowe
+stats_table <- data.frame(
+  Mean = colMeans(returns) * 252, # Zannualizowana średnia
+  SD = apply(returns, 2, sd) * sqrt(252), # Zannualizowane odch. std.
+  Skewness = apply(returns, 2, skewness),
+  Kurtosis = apply(returns, 2, kurtosis),
+  Min = apply(returns, 2, min),
+  Max = apply(returns, 2, max)
+)
+print("Statystyki opisowe (zannualizowane dla średniej i SD):")
+print(round(stats_table, 4))
+```
+
+```{r}
+# 3. Wykresy skumulowanych stóp zwrotu z linią 0
+cum_returns <- cumsum(returns)
+cum_returns_df <- data.frame(Date = index(cum_returns), coredata(cum_returns)) %>%
+  pivot_longer(-Date, names_to = "Ticker", values_to = "Value")
+
+p1 <- ggplot(cum_returns_df, aes(x = Date, y = Value, color = Ticker)) +
+  geom_line(size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Skumulowane log-stopy zwrotu (2018-2025)",
+       subtitle = "Linia przerywana oznacza poziom zerowego zwrotu",
+       y = "Skumulowany zwrot", x = "Data")
+print(p1)
+
+# 4. Macierz korelacji (Heatmap)
+corr_matrix <- cor(returns)
+p2 <- ggcorrplot(corr_matrix, hc.order = TRUE, type = "lower",
+           lab = TRUE, lab_size = 3, method="circle", 
+           colors = c("#E46726", "white", "#6D9EC1"),
+           title="Macierz korelacji stóp zwrotu")
+print(p2)
+```
+
+```{r}
+# 3. Definicja okresów
+periods <- list(
+  Full = c("2018-01-01", "2025-12-31"),
+  P1 = c("2018-03-01", "2020-01-31"),
+  P2 = c("2020-03-01", "2022-01-31"),
+  P3 = c("2022-03-01", "2024-01-31")
+)
+# 2. Funkcja do przeprowadzenia testu ADF
+run_adf <- function(series) {
+  test <- adf.test(series, alternative = "stationary", k = 10)
+  return(test$p.value)
+}
+
+# 3. Przeprowadzenie testów dla poziomów i zwrotów
+adf_levels <- apply(prices, 2, run_adf)
+adf_returns <- apply(returns, 2, run_adf)
+
+# 4. Prezentacja wyników w tabeli
+adf_results <- data.frame(
+  Ticker = tickers,
+  P_Value_Levels = round(adf_levels, 4),
+  P_Value_Returns = round(adf_returns, 4),
+  Stationary_Returns = ifelse(adf_returns < 0.05, "TAK", "NIE")
+)
+print("Wyniki testu ADF (p-value):")
+print(adf_results)
+```
+
+```{r}
+
+full_lag = as.numeric(VARselect( returns[paste0(periods$Full[1], "/", periods$Full[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+P1_lag = as.numeric(VARselect( returns[paste0(periods$P1[1], "/", periods$P1[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+P2_lag = as.numeric(VARselect( returns[paste0(periods$P2[1], "/", periods$P2[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+P3_lag = as.numeric(VARselect( returns[paste0(periods$P3[1], "/", periods$P3[2])], lag.max = 10, type = "const")$selection["HQ(n)"])
+
+lag_list = list( 
+  Full = full_lag,
+  P1 = P1_lag,
+  P2 = P2_lag,
+  P3 = P3_lag)
+```
+
+```{r}
+check_var_comprehensive <- function(data, p_name, p_dates, lags) {
+  # Wybór podzbioru danych
+  subset_data <- data[paste0(p_dates[1], "/", p_dates[2])]
+  
+  # Pobranie predefiniowanego laga z listy
+  p_lag <- lags[[p_name]]
+  
+  # Zapewnienie, że p_lag jest co najmniej 1
+  if(is.null(p_lag) || p_lag == 0) p_lag <- 1
+  
+  # Estymacja modelu
+  var_model <- VAR(subset_data, p = p_lag, type = "const")
+  var_summ <- summary(var_model)
+  
+  cat("\n========================================================\n")
+  cat("ANALIZA DLA OKRESU:", p_name, "| UŻYTE OPÓŹNIENIE (p):", p_lag, "\n")
+  cat("========================================================\n")
+  
+  # --- 1. ISTOTNOŚĆ PARAMETRÓW ---
+  cat("\n>>> ISTOTNE PARAMETRY (p < 0.05):\n")
+  for(ticker in colnames(subset_data)) {
+    coefs <- var_summ$varresult[[ticker]]$coefficients
+    sig_coefs <- coefs[coefs[, 4] < 0.05, , drop = FALSE]
+    if(nrow(sig_coefs) > 0) {
+      cat("\nRównanie", ticker, ":\n")
+      print(round(sig_coefs, 4))
+    }
+  }
+  
+  # --- 2. STATYSTYKI DOPASOWANIA ---
+  cat("\n>>> DOPASOWANIE MODELU (Adjusted R-squared):\n")
+  adj_r2 <- sapply(var_model$varresult, function(x) summary(x)$adj.r.squared)
+  print(round(adj_r2, 4))
+  
+  # --- 3. TESTY DIAGNOSTYCZNE ---
+  cat("\n>>> DIAGNOSTYKA RESZT (p-values):\n")
+  
+  # Test Autokorelacji (Portmanteau)
+  ser_p <- serial.test(var_model, lags.pt = 10, type = "PT.asymptotic")$serial$p.value
+  # Test Normalności (Jarque-Bera)
+  norm_p <- normality.test(var_model, multivariate.only = TRUE)$jb.mul$JB$p.value
+  # Test ARCH-LM  
+  arch_p <- arch.test(var_model, lags.multi = 5, multivariate.only = TRUE)$arch.mul$p.value
+
+  diag_df <- data.frame(
+    Test = c("Autokorelacja (Serial)", "Normalność (JB)", "Efekt ARCH"),
+    P_Value = round(c(ser_p, norm_p, arch_p), 4),
+    Status = ifelse(c(ser_p, norm_p, arch_p) > 0.05, "(H0 przyjęta)", "(H0 odrzucona)")
+  )
+  print(diag_df)
+  
+  return(var_model)
+}
+
+# 3. Wykonanie pętli z przekazaniem lag_list
+results_list <- lapply(names(periods), function(n) {
+  check_var_comprehensive(returns, n, periods[[n]], lag_list)
+})
+```
+
+
+```{r}
+library(lmtest)
+library(sandwich)
+
+run_robust_granger_matrix <- function(data, p_name, p_dates, lags) {
+  
+  subset_data <- data[paste0(p_dates[1], "/", p_dates[2])]
+  tickers <- colnames(subset_data)
+  n <- length(tickers)
+  
+  # Pobranie opóźnienia
+  p_lag <- lags[[p_name]]
+  if(is.null(p_lag) || p_lag == 0) p_lag <- 1
+  
+  # Macierz wyników
+  p_matrix <- matrix(NA, nrow = n, ncol = n)
+  rownames(p_matrix) <- tickers
+  colnames(p_matrix) <- tickers
+  
+  cat("\n########################################################\n")
+  cat(" ROBUST GRANGER (Newey-West HAC) - OKRES:", p_name, "| LAG:", p_lag, "\n")
+  cat("########################################################\n")
+  
+  # Tabela na istotne wyniki
+  sig_df <- data.frame(
+    Okres = character(),
+    Przyczyna = character(),
+    Skutek = character(),
+    P_Value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  core_data <- coredata(subset_data)
+  n_rows <- nrow(core_data)
+  
+  for (i in 1:n) { # Target (Skutek)
+    for (j in 1:n) { # Source (Przyczyna)
+      if (i != j) {
+        target_name <- tickers[i]
+        source_name <- tickers[j]
+        
+        y_vec <- core_data[(p_lag + 1):n_rows, i]
+        
+        target_lags <- embed(core_data[, i], p_lag + 1)[, -1, drop = FALSE]
+        source_lags <- embed(core_data[, j], p_lag + 1)[, -1, drop = FALSE]
+        
+        # Model Pełny (Unrestricted)
+        df_unres <- data.frame(Y = y_vec, target_lags, source_lags)
+        model_unres <- lm(Y ~ ., data = df_unres)
+        
+        # Model Ograniczony (Restricted)
+        df_res <- data.frame(Y = y_vec, target_lags)
+        model_res <- lm(Y ~ ., data = df_res)
+        
+        # Test Walda z Newey-West
+        wald_result <- waldtest(model_res, model_unres, vcov = NeweyWest(model_unres, lag = p_lag, prewhite = FALSE))
+        
+        p_val <- wald_result$`Pr(>F)`[2]
+        p_matrix[i, j] <- round(p_val, 4)
+        
+        # Jeśli istotne, dodaj do tabeli
+        if (!is.na(p_val) && p_val < 0.05) {
+          sig_df[nrow(sig_df) + 1, ] <- list(
+            Okres = p_name,
+            Przyczyna = source_name,
+            Skutek = target_name,
+            P_Value = round(p_val, 4)
+          )
+        }
+      }
+    }
+  }
+  
+  cat("\n>>> MACIERZ P-VALUE (HAC Newey-West):\n")
+  print(p_matrix)
+  
+  cat("\n>>> TABELA ISTOTNYCH ZALEŻNOŚCI (p < 0.05):\n")
+  if (nrow(sig_df) > 0) {
+    print(sig_df)
+  } else {
+    cat("Brak istotnych zależności w tym okresie.\n")
+  }
+  
+  # Zwracamy listę: Macierz + Tabela
+  return(list(Matrix = p_matrix, Significant = sig_df))
+}
+
+# Uruchomienie analizy
+robust_results <- lapply(names(periods), function(n) {
+  run_robust_granger_matrix(returns, n, periods[[n]], lag_list)
+})
+
+# --- OPCJONALNIE: ZBIORCZA TABELA NA KONIEC ---
+# Łączymy wyniki ze wszystkich okresów w jedną dużą tabelę
+all_sig_results <- do.call(rbind, lapply(robust_results, function(x) x$Significant))
+
+cat("\n========================================================\n")
+cat(" PODSUMOWANIE ZBIORCZE WSZYSTKICH ISTOTNYCH ZALEŻNOŚCI \n")
+cat("========================================================\n")
+print(all_sig_results)
+```
+
