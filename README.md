@@ -1,11 +1,11 @@
-# Ekonometria Dynamiczna / Dynamic Econometrics 📈
+# Ekonometria Finansowa i Dynamiczna / Financial and Dynamic Econometrics 📈
 
 [![PL](https://img.shields.io/badge/Język-Polski-red.svg)](#wersja-polska)
 [![EN](https://img.shields.io/badge/Language-English-blue.svg)](#english-version)
 
 > **Autorzy / Authors:** Patrycja Piła, Magdalena Wnuk, Julia Szutka, Mateusz Strojek  
 > II rok studiów magisterskich / 2nd year Master's degree program  
-
+> Obtained mark is 4.5
 ---
 
 ## 🇵🇱 Wersja Polska
