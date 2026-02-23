@@ -4,7 +4,7 @@
 [![EN](https://img.shields.io/badge/Language-English-blue.svg)](#english-version)
 
 > **Autorzy / Authors:** Patrycja Piła, Magdalena Wnuk, Julia Szutka, Mateusz Strojek  
-> **Poziom / Level:** I rok studiów magisterskich / 1st year Master's degree program  
+> II rok studiów magisterskich / 2nd year Master's degree program  
 
 ---
 
